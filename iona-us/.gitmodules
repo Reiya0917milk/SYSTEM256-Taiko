@@ -1,0 +1,6 @@
+[submodule "jvsio"]
+	path = jvsio
+	url = https://github.com/toyoshim/jvsio.git
+[submodule "chlib"]
+	path = chlib
+	url = https://github.com/toyoshim/chlib.git

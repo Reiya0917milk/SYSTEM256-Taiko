@@ -1,0 +1,16 @@
+.DS_Store
+.vscode/*.log
+test/*.o
+test/out
+test/test
+??/*.bin
+*.asm
+*.ihx
+*.lk
+*.lst
+*.map
+*.mem
+*.rel
+*.rst
+*.sym
+.vs/
