@@ -33,6 +33,81 @@ enum {
 };
 static uint8_t mode = MODE_NORMAL;
 
+// --- SYSTEM256 太鼓の達人 疑似アナログ入力 ---
+// 太鼓Assyの入力はSYSTEM256側で全てアナログ信号として扱われる。
+// 実機のTAIKO TESTメニュー(取扱説明書)により、1台の太鼓は
+// KL(左縁) DL(左面) DR(右面) KR(右縁) の4ゾーン構成と判明している。
+//
+// 実機のTAIKO TEST画面で総当たりした結果、analog[0..7]と実際のゾーンの
+// 対応は下記の通り（1Pポート挿しでanalog[0..3]、2Pポート挿しでanalog[4..7]
+// に書き込まれるが、中身は1P/2Pのゾーンが綺麗には分かれておらず混在している）：
+//   analog[0]=1P DL  analog[1]=2P KL  analog[2]=2P DL  analog[3]=1P DR
+//   analog[4]=1P KR  analog[5]=1P KL  analog[6]=2P KR  analog[7]=2P DR
+// そのため「hubで4つブロック分け」ではなく、hubとゾーンの組み合わせごとに
+// 個別のインデックスへ書き込む方式にしてある。これなら1P用/2P用どちらの
+// 太鼓デバイスも、挿すポート(1P/2P)にかかわらず同じ4キーで正しく動く。
+//
+// 下記キーコードはUSB HID Keyboard/Keypad Usage ID (Usage Page 0x07)。
+// 実際に接続するキーボード/おうち太鼓のレポートに合わせて変更すること。
+// デフォルトはD/F/J/K (太鼓シミュレータでよくあるDFJK配置)。
+#define TAIKO_KEY_KL 0x07  // D: 縁
+#define TAIKO_KEY_DL 0x09  // F: 面
+#define TAIKO_KEY_DR 0x0d  // J: 面
+#define TAIKO_KEY_KR 0x0e  // K: 縁
+
+// I/O TESTメニュー操作用（SELECT UP/DOWN, ENTER）とコイン投入用のキー。
+// SELUP/SELDOWNはJVSの標準的な1P上下スイッチと同一で、通常のコントローラ
+// と同じく settings->digital_map（ブラウザの「ボタン配置」）を経由させる。
+// ENTER(決定)は実機で総当たりした結果、RIGHTスロット(→キー)で反応することを
+// 確認済み。TEST/SERVICEはiona-us基板上の物理ボタンで代替可能なため、
+// ここでは扱わない。
+#define TAIKO_KEY_SELECT_UP 0x52     // ↑キー
+#define TAIKO_KEY_SELECT_DOWN 0x51   // ↓キー
+#define TAIKO_KEY_ENTER 0x4f         // →キー: ENTER(決定)として動作確認済み
+#define TAIKO_KEY_COIN 0x22          // 5キー（mahjong_updateのコイン割当と揃えた）
+
+// キー割り当てテーブル。ブラウザの書き込みツールが iona.bin のバイト列から
+// 直接この並びを見つけて書き換えられるよう、先頭に4バイトの目印(マジック)を
+// 置いた1つの配列にまとめてある("TKMP" + 1P用8個 + 2P用8個のUsage ID)。
+// 1P/2Pそれぞれ独立して設定できるよう、hubごとに別ブロックを持つ。
+// 各ブロックの順序: KL, DL, DR, KR, SELECT_UP, SELECT_DOWN, ENTER, COIN
+static const __code uint8_t keymap_with_magic[4 + 16] = {
+    'T', 'K', 'M', 'P',
+    // 1P (hub 0)
+    TAIKO_KEY_KL,        TAIKO_KEY_DL,   TAIKO_KEY_DR,  TAIKO_KEY_KR,
+    TAIKO_KEY_SELECT_UP, TAIKO_KEY_SELECT_DOWN, TAIKO_KEY_ENTER, TAIKO_KEY_COIN,
+    // 2P (hub 1) 初期値は1Pと同じ
+    TAIKO_KEY_KL,        TAIKO_KEY_DL,   TAIKO_KEY_DR,  TAIKO_KEY_KR,
+    TAIKO_KEY_SELECT_UP, TAIKO_KEY_SELECT_DOWN, TAIKO_KEY_ENTER, TAIKO_KEY_COIN,
+};
+#define KEYMAP(hub) (&keymap_with_magic[4 + (hub) * 8])
+
+// ゲームパッド(太鼓フォース、未改造タタコン等)のボタン→太鼓ゾーン割り当て。
+// info->button[]のインデックス(0-12、HID_BUTTON_1..META)を格納する。
+// キーボードと同じくマジックバイト("GPMP")付きの配列にして、ブラウザ側から
+// バイナリを直接パッチできるようにしてある。0xffは「未割り当て」の意味で、
+// その場合は当該ゾーンへの書き込みを行わない(既存のアナログ設定等を邪魔しない)。
+// 順序: KL, DL, DR, KR (1Pブロック×4, 2Pブロック×4)
+// デフォルトはHID_BUTTON_1〜4(ボタン1〜4)を仮に割り当ててあるが、実機の
+// ボタン配置は機種依存なので、TAIKO TESTで確認しながら調整すること。
+static const __code uint8_t gamepad_keymap_with_magic[4 + 8] = {
+    'G', 'P', 'M', 'P',
+    0, 1, 2, 3,  // 1P (hub 0): KL, DL, DR, KR
+    0, 1, 2, 3,  // 2P (hub 1): KL, DL, DR, KR
+};
+#define GAMEPAD_KEYMAP(hub) (&gamepad_keymap_with_magic[4 + (hub) * 4])
+
+static bool key_pressed(const uint8_t* data, uint8_t keycode) {
+  // USBキーボードレポート(8byte): byte0=修飾キー, byte1=予約,
+  // byte2-7=最大6キー同時押しのUsage ID(0はキー無し)。
+  for (uint8_t i = 2; i < 8; ++i) {
+    if (data[i] == keycode) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool button_check(uint16_t index, const uint8_t* data) {
   if (index == 0xffff) {
     return false;
@@ -219,12 +294,47 @@ void controller_update(uint8_t hub_index,
 
   if (info->type == HID_TYPE_KEYBOARD) {
     if (size == 8) {
-      mode = MODE_MAHJONG;
-      mahjong_update(data);
+      // 実機のTAIKO TESTで確認した実際のインデックス対応（ファイル冒頭コメント参照）。
+      // hub 0 = 1Pポート、hub 1 = 2Pポート。
+      const __code uint8_t* keymap = KEYMAP(hub);
+      bool kl = key_pressed(data, keymap[0]);
+      bool dl = key_pressed(data, keymap[1]);
+      bool dr = key_pressed(data, keymap[2]);
+      bool kr = key_pressed(data, keymap[3]);
+      if (hub == 0) {
+        analog[5] = kl ? 0xffff : 0x0000;  // 1P KL
+        analog[0] = dl ? 0xffff : 0x0000;  // 1P DL
+        analog[3] = dr ? 0xffff : 0x0000;  // 1P DR
+        analog[4] = kr ? 0xffff : 0x0000;  // 1P KR
+      } else {
+        analog[1] = kl ? 0xffff : 0x0000;  // 2P KL
+        analog[2] = dl ? 0xffff : 0x0000;  // 2P DL
+        analog[7] = dr ? 0xffff : 0x0000;  // 2P DR
+        analog[6] = kr ? 0xffff : 0x0000;  // 2P KR
+      }
+
+      // I/O TESTメニュー操作（SELECT UP/DOWN, ENTER）。
+      // 既存のu/d/l/rパイプラインをそのまま使い、実際のJVSビットへの変換は
+      // ブラウザの「ボタン配置」設定（settings->digital_map）に委ねる。
+      struct settings* settings = settings_get();
+      bool select_up = key_pressed(data, keymap[4]);
+      bool select_down = key_pressed(data, keymap[5]);
+      bool enter = key_pressed(data, keymap[6]);
+      update_digital_map(digital_map[hub], settings->digital_map[hub][0].data,
+                          select_up);
+      update_digital_map(digital_map[hub], settings->digital_map[hub][1].data,
+                          select_down);
+      update_digital_map(digital_map[hub], settings->digital_map[hub][3].data,
+                          enter);
+
+      // コイン投入（立ち上がりエッジで1枚加算、mahjong_updateと同じ方式）。
+      bool coin_key = key_pressed(data, keymap[7]);
+      coin_sw[hub] = (coin_sw[hub] << 1) | (coin_key ? 1 : 0);
+      if ((coin_sw[hub] & 3) == 1) {
+        coin[hub]++;
+      }
     }
     return;
-  } else if (mode == MODE_MAHJONG) {
-    mode = MODE_NORMAL;
   }
 
   if (info->report_id) {
@@ -278,6 +388,30 @@ void controller_update(uint8_t hub_index,
       case AT_SCREEN:
         screen[index] = value;
         break;
+    }
+  }
+
+  // ゲームパッド(太鼓フォース、未改造タタコン等)のボタンによる太鼓ゾーン入力。
+  // 0xff(未割り当て)のスロットは何もしない(上のアナログ設定等を邪魔しない)。
+  // analog[]への実際の書き込み先はキーボードと同じ対応表(ファイル冒頭コメント参照)。
+  {
+    const __code uint8_t* gp = GAMEPAD_KEYMAP(hub);
+    bool gp_kl = (gp[0] != 0xff) && button_check(info->button[gp[0]], data);
+    bool gp_dl = (gp[1] != 0xff) && button_check(info->button[gp[1]], data);
+    bool gp_dr = (gp[2] != 0xff) && button_check(info->button[gp[2]], data);
+    bool gp_kr = (gp[3] != 0xff) && button_check(info->button[gp[3]], data);
+    if (gp[0] != 0xff || gp[1] != 0xff || gp[2] != 0xff || gp[3] != 0xff) {
+      if (hub == 0) {
+        if (gp[0] != 0xff) analog[5] = gp_kl ? 0xffff : 0x0000;  // 1P KL
+        if (gp[1] != 0xff) analog[0] = gp_dl ? 0xffff : 0x0000;  // 1P DL
+        if (gp[2] != 0xff) analog[3] = gp_dr ? 0xffff : 0x0000;  // 1P DR
+        if (gp[3] != 0xff) analog[4] = gp_kr ? 0xffff : 0x0000;  // 1P KR
+      } else {
+        if (gp[0] != 0xff) analog[1] = gp_kl ? 0xffff : 0x0000;  // 2P KL
+        if (gp[1] != 0xff) analog[2] = gp_dl ? 0xffff : 0x0000;  // 2P DL
+        if (gp[2] != 0xff) analog[7] = gp_dr ? 0xffff : 0x0000;  // 2P DR
+        if (gp[3] != 0xff) analog[6] = gp_kr ? 0xffff : 0x0000;  // 2P KR
+      }
     }
   }
 

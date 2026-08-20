@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>iona-us ローカルファームウェア書き込み</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }
+  button { font-size: 1.1em; padding: 0.5em 1em; margin: 0.3em 0; }
+  progress { width: 100%; }
+  #error { white-space: pre-wrap; background: #eee; padding: 0.5em; }
+</style>
+</head>
+<body>
+<h1>iona-us ローカルファームウェア書き込み</h1>
+<p>SERVICEボタンを押しながらType-A to Type-Aケーブルで1Pポートに接続してから操作してください。</p>
+
+<p><input type="file" id="file" accept=".bin"></p>
+<button id="flash" disabled>書き込み</button>
+
+<table>
+<tr><td>書き込み</td><td>0% <progress id="progress_write" max="1" value="0"></progress> 100%</td></tr>
+<tr><td>検証</td><td>0% <progress id="progress_verify" max="1" value="0"></progress> 100%</td></tr>
+</table>
+
+<h3>結果</h3>
+<pre id="error">ファイルを選択してください</pre>
+
+<script src="https://toyoshim.github.io/CH559Flasher.js/CH559Flasher.js"></script>
+<script>
+  let selectedBin = null;
+  const fileInput = document.getElementById('file');
+  const flashButton = document.getElementById('flash');
+  const errorEl = document.getElementById('error');
+
+  fileInput.addEventListener('change', async () => {
+    const f = fileInput.files[0];
+    if (!f) return;
+    selectedBin = await f.arrayBuffer();
+    errorEl.innerText = `選択済み: ${f.name} (${selectedBin.byteLength} bytes)`;
+    flashButton.disabled = false;
+  });
+
+  flashButton.addEventListener('click', async () => {
+    const progressWrite = document.getElementById('progress_write');
+    const progressVerify = document.getElementById('progress_verify');
+    progressWrite.value = 0;
+    progressVerify.value = 0;
+    errorEl.innerText = '接続中...';
+    try {
+      const flasher = new CH559Flasher();
+      await flasher.connect();
+      errorEl.innerText = '消去中...';
+      await flasher.erase();
+      errorEl.innerText = '書き込み中...';
+      await flasher.write(selectedBin, rate => progressWrite.value = rate);
+      errorEl.innerText = '検証中...';
+      await flasher.verify(selectedBin, rate => progressVerify.value = rate);
+      errorEl.innerText = flasher.error ? ('エラー: ' + flasher.error) : '成功';
+    } catch (e) {
+      errorEl.innerText = '例外が発生しました: ' + e;
+    }
+  });
+</script>
+</body>
+</html>
