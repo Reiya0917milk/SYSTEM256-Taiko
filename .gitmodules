@@ -1,0 +1,6 @@
+[submodule "iona-us/jvsio"]
+	path = iona-us/jvsio
+	url = https://github.com/toyoshim/jvsio.git
+[submodule "iona-us/chlib"]
+	path = iona-us/chlib
+	url = https://github.com/toyoshim/chlib.git
