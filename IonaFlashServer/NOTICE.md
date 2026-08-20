@@ -36,8 +36,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-改造版のiona-usファームウェアソースはこちら:
-https://github.com/Reiya0917milk/iona-us
+改造版のiona-usファームウェアソースは、このリポジトリの[`../iona-us/`](../iona-us)にあります。
 
 このリポジトリ内の`IonaFlashServer`（C#の書き込みツール本体、`Program.cs`、
 `Resources/flash_local.html`）はオリジナルのコードです。

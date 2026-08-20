@@ -3,8 +3,7 @@
 MP07-IONA-US（[iona-us](https://github.com/toyoshim/iona-us)、CH559ベースのJVS I/O基板）に、
 namco SYSTEM256の太鼓の達人向けに改造したファームウェアを書き込むためのローカルツールです。
 
-改造版iona-usファームウェアのソースはこちら:
-https://github.com/Reiya0917milk/iona-us
+改造版iona-usファームウェアのソースは、このリポジトリの[`../iona-us/`](../iona-us)にあります。
 
 ## これは何をするツールか
 
