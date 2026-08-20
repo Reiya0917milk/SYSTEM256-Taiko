@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>iona-us ローカルファームウェア書き込み</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }
+  button { font-size: 1.05em; padding: 0.4em 0.9em; margin: 0.2em 0; }
+  progress { width: 100%; }
+  #error { white-space: pre-wrap; background: #eee; padding: 0.5em; }
+  table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+  th, td { border: 1px solid #ccc; padding: 0.4em 0.6em; text-align: left; }
+  .key-label { font-family: monospace; font-weight: bold; }
+  .listening { background: #ffe9a8; }
+</style>
+</head>
+<body>
+<h1>iona-us ローカルファームウェア書き込み</h1>
+<p>SERVICEボタンを押しながらType-A to Type-Aケーブルで1Pポートに接続してから操作してください。</p>
+<p>ファームウェア(iona.bin)はこのサーバー(exe)に埋め込まれているので、ファイル選択は不要です。</p>
+
+<h2>キー割り当て設定（キーボード）</h2>
+<p>「変更」を押した後、割り当てたいキーを押してください。設定は下の「書き込み」ボタンを押した時に反映されます。1P・2Pは独立して設定できます。</p>
+<table id="keymapTable">
+  <tr><th>機能</th><th>1Pキー</th><th></th><th>2Pキー</th><th></th></tr>
+</table>
+
+<h2>ボタン割り当て設定（ゲームパッド／太鼓フォース／未改造タタコン等）</h2>
+<p>太鼓の4ゾーンのみ対応（メニュー操作はゲームパッドなら通常そのまま使えます）。
+実機のボタン番号との対応は機種依存なので、選んで書き込んだ後にTAIKO TESTで確認・調整してください。</p>
+<table id="gamepadKeymapTable">
+  <tr><th>ゾーン</th><th>1Pボタン</th><th>2Pボタン</th></tr>
+</table>
+
+<h2>書き込み</h2>
+<button id="flash">書き込み</button>
+
+<table>
+<tr><td>書き込み</td><td>0% <progress id="progress_write" max="1" value="0"></progress> 100%</td></tr>
+<tr><td>検証</td><td>0% <progress id="progress_verify" max="1" value="0"></progress> 100%</td></tr>
+</table>
+
+<h3>結果</h3>
+<pre id="error">ファームウェア読み込み中...</pre>
+
+<script src="https://toyoshim.github.io/CH559Flasher.js/CH559Flasher.js"></script>
+<script>
+  // USB HID Keyboard/Keypad Usage ID (Usage Page 0x07) への変換テーブル。
+  // ブラウザのKeyboardEvent.codeはUSB HID Usage IDとほぼ1:1対応するよう
+  // 設計されているため、主要なキーだけ手動でテーブル化してある。
+  // (Shift/Ctrl/Alt等の修飾キーはファームウェア側が見ていないので対象外)
+  const CODE_TO_USAGE = {
+    KeyA: 0x04, KeyB: 0x05, KeyC: 0x06, KeyD: 0x07, KeyE: 0x08, KeyF: 0x09,
+    KeyG: 0x0a, KeyH: 0x0b, KeyI: 0x0c, KeyJ: 0x0d, KeyK: 0x0e, KeyL: 0x0f,
+    KeyM: 0x10, KeyN: 0x11, KeyO: 0x12, KeyP: 0x13, KeyQ: 0x14, KeyR: 0x15,
+    KeyS: 0x16, KeyT: 0x17, KeyU: 0x18, KeyV: 0x19, KeyW: 0x1a, KeyX: 0x1b,
+    KeyY: 0x1c, KeyZ: 0x1d,
+    Digit1: 0x1e, Digit2: 0x1f, Digit3: 0x20, Digit4: 0x21, Digit5: 0x22,
+    Digit6: 0x23, Digit7: 0x24, Digit8: 0x25, Digit9: 0x26, Digit0: 0x27,
+    Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c,
+    Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30,
+    Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35,
+    Comma: 0x36, Period: 0x37, Slash: 0x38,
+    F1: 0x3a, F2: 0x3b, F3: 0x3c, F4: 0x3d, F5: 0x3e, F6: 0x3f,
+    F7: 0x40, F8: 0x41, F9: 0x42, F10: 0x43, F11: 0x44, F12: 0x45,
+    Insert: 0x49, Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d,
+    PageDown: 0x4e,
+    ArrowRight: 0x4f, ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52,
+  };
+  const LABEL_OVERRIDE = {
+    ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→',
+    Enter: 'Enter', Space: 'Space', Escape: 'Esc', Backspace: 'BackSpace',
+    Tab: 'Tab',
+  };
+  function codeToLabel(code) {
+    return LABEL_OVERRIDE[code] || code.replace(/^Key|^Digit/, '');
+  }
+  function usageToLabel(usage) {
+    for (const code in CODE_TO_USAGE) {
+      if (CODE_TO_USAGE[code] === usage) {
+        return codeToLabel(code);
+      }
+    }
+    return '0x' + usage.toString(16).padStart(2, '0') + '(未知)';
+  }
+
+  // 各プレイヤーのブロック内での並び順（1Pブロック=offset0-7、2Pブロック=offset8-15）。
+  const SLOTS = [
+    { name: 'KL（縁）' },
+    { name: 'DL（面）' },
+    { name: 'DR（面）' },
+    { name: 'KR（縁）' },
+    { name: 'SELECT UP（メニュー↑）' },
+    { name: 'SELECT DOWN（メニュー↓）' },
+    { name: 'ENTER（決定）' },
+    { name: 'COIN（コイン投入）' },
+  ];
+  const MAGIC = [0x54, 0x4b, 0x4d, 0x50];  // "TKMP"
+
+  // info->button[]のインデックス(hid.hのHID_BUTTON_*と対応)。
+  const GAMEPAD_BUTTON_LABELS = [
+    'ボタン1', 'ボタン2', 'ボタン3', 'ボタン4',
+    'L1', 'R1', 'L2', 'R2', 'SELECT', 'START', 'L3', 'R3', 'META',
+  ];
+  const GAMEPAD_SLOTS = ['KL（縁）', 'DL（面）', 'DR（面）', 'KR（縁）'];
+  const GAMEPAD_MAGIC = [0x47, 0x50, 0x4d, 0x50];  // "GPMP"
+  const GAMEPAD_UNASSIGNED = 0xff;
+
+  let originalBin = null;   // ArrayBuffer（サーバーから取得した元のバイナリ）
+  let magicOffset = -1;     // originalBin内でのマジック開始位置
+  let keymap = null;        // 現在編集中のキー割り当て(Usage ID 16個、[0-7]=1P, [8-15]=2P)
+  let gamepadMagicOffset = -1;  // GPMPの開始位置
+  let gamepadKeymap = null;     // ボタン番号8個、[0-3]=1P, [4-7]=2P
+
+  function findMagic(bytes, magic) {
+    for (let i = 0; i + magic.length <= bytes.length; ++i) {
+      let match = true;
+      for (let j = 0; j < magic.length; ++j) {
+        if (bytes[i + j] !== magic[j]) { match = false; break; }
+      }
+      if (match) return i;
+    }
+    return -1;
+  }
+
+  function renderGamepadTable() {
+    const table = document.getElementById('gamepadKeymapTable');
+    table.innerHTML = '<tr><th>ゾーン</th><th>1Pボタン</th><th>2Pボタン</th></tr>';
+    GAMEPAD_SLOTS.forEach((name, i) => {
+      const tr = document.createElement('tr');
+      const tdName = document.createElement('td');
+      tdName.innerText = name;
+      tr.appendChild(tdName);
+      tr.appendChild(makeGamepadSelectCell(i));      // 1P (index 0-3)
+      tr.appendChild(makeGamepadSelectCell(i + 4));  // 2P (index 4-7)
+      table.appendChild(tr);
+    });
+  }
+
+  function makeGamepadSelectCell(index) {
+    const td = document.createElement('td');
+    const select = document.createElement('select');
+    const noneOpt = document.createElement('option');
+    noneOpt.value = GAMEPAD_UNASSIGNED;
+    noneOpt.innerText = '未割り当て';
+    select.appendChild(noneOpt);
+    GAMEPAD_BUTTON_LABELS.forEach((label, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.innerText = label;
+      select.appendChild(opt);
+    });
+    select.value = gamepadKeymap[index];
+    select.addEventListener('change', () => {
+      gamepadKeymap[index] = parseInt(select.value, 10);
+    });
+    td.appendChild(select);
+
+    const detectBtn = document.createElement('button');
+    detectBtn.innerText = '検出';
+    const status = document.createElement('div');
+    status.style.fontSize = '0.85em';
+    status.style.color = '#666';
+    detectBtn.addEventListener('click', () => {
+      startGamepadListening(select, status);
+    });
+    td.appendChild(detectBtn);
+    td.appendChild(status);
+    return td;
+  }
+
+  // ブラウザのGamepad APIでボタン押下を検出する。
+  // 注意：ブラウザ側のボタン番号は、iona-us(ファームウェア)側のボタン番号と
+  // 必ずしも一致しない(別々の方法で解析しているため)。ここで検出した値は
+  // あくまで候補で、書き込み後に実機のTAIKO TESTで必ず確認・調整すること。
+  let gamepadListenCancel = null;
+  function startGamepadListening(select, status) {
+    if (gamepadListenCancel) {
+      gamepadListenCancel();
+    }
+    status.innerText = 'パッドのボタンを押してください...(候補です。書き込み後に実機で要確認)';
+
+    // 既に押されているボタンは無視するため、開始時点の状態を控えておく。
+    const baseline = {};
+    for (const gp of navigator.getGamepads()) {
+      if (!gp) continue;
+      baseline[gp.index] = gp.buttons.map(b => b.pressed);
+    }
+
+    let cancelled = false;
+    gamepadListenCancel = () => { cancelled = true; };
+
+    function poll() {
+      if (cancelled) return;
+      for (const gp of navigator.getGamepads()) {
+        if (!gp) continue;
+        const base = baseline[gp.index] || [];
+        for (let i = 0; i < gp.buttons.length; ++i) {
+          if (gp.buttons[i].pressed && !base[i]) {
+            if (i > 12) {
+              status.innerText =
+                  'ボタン' + i + 'を検出しましたが対応表の範囲外(0-12)です。' +
+                  '手動でプルダウンから選んでください。';
+              cancelled = true;
+              return;
+            }
+            select.value = String(i);
+            select.dispatchEvent(new Event('change'));
+            status.innerText =
+                'ブラウザ側でボタン' + i + 'を検出しました(候補)。' +
+                '書き込み後に実機で確認してください。';
+            cancelled = true;
+            return;
+          }
+        }
+      }
+      requestAnimationFrame(poll);
+    }
+    requestAnimationFrame(poll);
+  }
+
+  function makeKeyCell(index) {
+    const td = document.createElement('td');
+    td.className = 'key-label';
+    td.id = 'key' + index;
+    td.innerText = usageToLabel(keymap[index]);
+    return td;
+  }
+
+  function makeButtonCell(index) {
+    const td = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.innerText = '変更';
+    btn.addEventListener('click', () => startListening(index));
+    td.appendChild(btn);
+    return td;
+  }
+
+  function renderTable() {
+    const table = document.getElementById('keymapTable');
+    table.innerHTML =
+        '<tr><th>機能</th><th>1Pキー</th><th></th><th>2Pキー</th><th></th></tr>';
+    SLOTS.forEach((slot, i) => {
+      const tr = document.createElement('tr');
+      tr.id = 'row' + i + '_row' + (i + 8);  // 1P/2P両方分の行識別用
+      const tdName = document.createElement('td');
+      tdName.innerText = slot.name;
+      tr.appendChild(tdName);
+      tr.appendChild(makeKeyCell(i));         // 1P (index 0-7)
+      tr.appendChild(makeButtonCell(i));
+      tr.appendChild(makeKeyCell(i + 8));     // 2P (index 8-15)
+      tr.appendChild(makeButtonCell(i + 8));
+      table.appendChild(tr);
+    });
+  }
+
+  function startListening(index) {
+    const keyCell = document.getElementById('key' + index);
+    keyCell.classList.add('listening');
+    keyCell.innerText = 'キーを押してください...';
+
+    const onKeyDown = (ev) => {
+      ev.preventDefault();
+      const usage = CODE_TO_USAGE[ev.code];
+      if (usage === undefined) {
+        keyCell.innerText = '未対応のキーです。別のキーを押してください';
+        return;
+      }
+      keymap[index] = usage;
+      keyCell.innerText = usageToLabel(usage);
+      keyCell.classList.remove('listening');
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+  }
+
+  async function init() {
+    const errorEl = document.getElementById('error');
+    try {
+      const res = await fetch('/iona.bin');
+      if (!res.ok) {
+        throw new Error('iona.binの取得に失敗しました: ' + res.status);
+      }
+      originalBin = await res.arrayBuffer();
+      const bytes = new Uint8Array(originalBin);
+      magicOffset = findMagic(bytes, MAGIC);
+      if (magicOffset < 0) {
+        throw new Error('キー割り当てテーブル(マジックバイト)が見つかりません。' +
+            'このファームウェアはキー変更に対応していない可能性があります。');
+      }
+      keymap = Array.from(bytes.slice(magicOffset + 4, magicOffset + 20));
+      renderTable();
+
+      gamepadMagicOffset = findMagic(bytes, GAMEPAD_MAGIC);
+      if (gamepadMagicOffset < 0) {
+        throw new Error('ゲームパッド用ボタン割り当てテーブルが見つかりません。' +
+            'このファームウェアはボタン変更に対応していない可能性があります。');
+      }
+      gamepadKeymap =
+          Array.from(bytes.slice(gamepadMagicOffset + 4, gamepadMagicOffset + 12));
+      renderGamepadTable();
+
+      errorEl.innerText = '準備完了。「書き込み」ボタンを押してください';
+    } catch (e) {
+      errorEl.innerText = '例外が発生しました: ' + e;
+    }
+  }
+
+  document.getElementById('flash').addEventListener('click', async () => {
+    const progressWrite = document.getElementById('progress_write');
+    const progressVerify = document.getElementById('progress_verify');
+    const errorEl = document.getElementById('error');
+    progressWrite.value = 0;
+    progressVerify.value = 0;
+    try {
+      if (!originalBin || magicOffset < 0 || gamepadMagicOffset < 0) {
+        throw new Error('ファームウェアがまだ準備できていません');
+      }
+      // 元のバイナリをコピーし、キー/ボタン割り当て部分だけ書き換える。
+      const patched = new Uint8Array(originalBin.slice(0));
+      for (let i = 0; i < keymap.length; ++i) {
+        patched[magicOffset + 4 + i] = keymap[i];
+      }
+      for (let i = 0; i < gamepadKeymap.length; ++i) {
+        patched[gamepadMagicOffset + 4 + i] = gamepadKeymap[i];
+      }
+
+      errorEl.innerText = '接続中...';
+      const flasher = new CH559Flasher();
+      await flasher.connect();
+      errorEl.innerText = '消去中...';
+      await flasher.erase();
+      errorEl.innerText = '書き込み中...';
+      await flasher.write(patched.buffer, rate => progressWrite.value = rate);
+      errorEl.innerText = '検証中...';
+      await flasher.verify(patched.buffer, rate => progressVerify.value = rate);
+      errorEl.innerText = flasher.error ? ('エラー: ' + flasher.error) : '成功';
+    } catch (e) {
+      errorEl.innerText = '例外が発生しました: ' + e;
+    }
+  });
+
+  init();
+</script>
+</body>
+</html>
