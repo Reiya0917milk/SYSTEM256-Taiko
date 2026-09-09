@@ -121,6 +121,35 @@
   let pulseMagicOffset = -1;    // TPLSの開始位置
   let pulseMsec = 20;           // 現在編集中のパルス幅(ms)
 
+  // --- 設定の保存(localStorage) ---
+  // このページはexeに埋め込まれた初期状態のiona.binを毎回読み込むため、
+  // 何もしないと閉じて開き直すたびに編集内容が消えてしまう。
+  // ブラウザのlocalStorage(このPC・このURL専用の保存領域)に編集内容を
+  // 自動保存し、次回開いたときに復元する。
+  const STORAGE_KEY = 'taikoS256_flash_settings';
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        keymap: keymap,
+        gamepadKeymap: gamepadKeymap,
+        pulseMsec: pulseMsec,
+      }));
+    } catch (e) {
+      // localStorageが使えない環境でも致命的にはしない。
+    }
+  }
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (e) {
+      return null;
+    }
+  }
+
   function findMagic(bytes, magic) {
     for (let i = 0; i + magic.length <= bytes.length; ++i) {
       let match = true;
@@ -162,6 +191,7 @@
     select.value = gamepadKeymap[index];
     select.addEventListener('change', () => {
       gamepadKeymap[index] = parseInt(select.value, 10);
+      saveSettings();
     });
     td.appendChild(select);
 
@@ -279,6 +309,7 @@
       keyCell.innerText = usageToLabel(usage);
       keyCell.classList.remove('listening');
       window.removeEventListener('keydown', onKeyDown, true);
+      saveSettings();
     };
     window.addEventListener('keydown', onKeyDown, true);
   }
@@ -298,7 +329,6 @@
             'このファームウェアはキー変更に対応していない可能性があります。');
       }
       keymap = Array.from(bytes.slice(magicOffset + 4, magicOffset + 20));
-      renderTable();
 
       gamepadMagicOffset = findMagic(bytes, GAMEPAD_MAGIC);
       if (gamepadMagicOffset < 0) {
@@ -307,7 +337,6 @@
       }
       gamepadKeymap =
           Array.from(bytes.slice(gamepadMagicOffset + 4, gamepadMagicOffset + 12));
-      renderGamepadTable();
 
       pulseMagicOffset = findMagic(bytes, PULSE_MAGIC);
       if (pulseMagicOffset < 0) {
@@ -315,6 +344,27 @@
             'このファームウェアはパルス幅調整に対応していない可能性があります。');
       }
       pulseMsec = bytes[pulseMagicOffset + 4];
+
+      // 前回このページで保存した設定があれば復元する(無ければ、今exeに
+      // 埋め込まれているファームウェアそのままの値を使う)。
+      const saved = loadSettings();
+      if (saved) {
+        if (Array.isArray(saved.keymap) && saved.keymap.length === keymap.length) {
+          keymap = saved.keymap;
+        }
+        if (Array.isArray(saved.gamepadKeymap) &&
+            saved.gamepadKeymap.length === gamepadKeymap.length) {
+          gamepadKeymap = saved.gamepadKeymap;
+        }
+        if (typeof saved.pulseMsec === 'number' &&
+            saved.pulseMsec >= 1 && saved.pulseMsec <= 255) {
+          pulseMsec = saved.pulseMsec;
+        }
+      }
+
+      renderTable();
+      renderGamepadTable();
+
       const pulseInput = document.getElementById('pulseMsec');
       pulseInput.value = pulseMsec;
       pulseInput.addEventListener('change', () => {
@@ -323,9 +373,12 @@
         if (v > 255) v = 255;
         pulseMsec = v;
         pulseInput.value = v;
+        saveSettings();
       });
 
-      errorEl.innerText = '準備完了。「書き込み」ボタンを押してください';
+      errorEl.innerText = saved
+          ? '準備完了(前回保存した設定を復元しました)。「書き込み」ボタンを押してください'
+          : '準備完了。「書き込み」ボタンを押してください';
     } catch (e) {
       errorEl.innerText = '例外が発生しました: ' + e;
     }
