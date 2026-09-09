@@ -6,6 +6,7 @@
 
 #include "ch559.h"
 #include "serial.h"
+#include "timer3.h"
 
 #include "settings.h"
 
@@ -50,6 +51,8 @@ static uint8_t mode = MODE_NORMAL;
 // 下記キーコードはUSB HID Keyboard/Keypad Usage ID (Usage Page 0x07)。
 // 実際に接続するキーボード/おうち太鼓のレポートに合わせて変更すること。
 // デフォルトはD/F/J/K (太鼓シミュレータでよくあるDFJK配置)。
+// (一度DR=Lに変更したが、根拠にしたログがPCキーボードを指で押した結果で
+// 実機の出力ではなかったため、実機で確認が取れるまでJに戻してある。)
 #define TAIKO_KEY_KL 0x07  // D: 縁
 #define TAIKO_KEY_DL 0x09  // F: 面
 #define TAIKO_KEY_DR 0x0d  // J: 面
@@ -97,6 +100,60 @@ static const __code uint8_t gamepad_keymap_with_magic[4 + 8] = {
 };
 #define GAMEPAD_KEYMAP(hub) (&gamepad_keymap_with_magic[4 + (hub) * 4])
 
+// --- 太鼓ヒット信号のエッジトリガー化(固定長パルス) ---
+// キーボード/ゲームパッドの「今その瞬間押されているか」をそのままanalog[]へ
+// 反映すると、連打時に前の打鍵の余韻が次の打鍵と重なって、SYSTEM256側から
+// 見て「ずっと押されっぱなしの1打」にしか見えなくなり、2打目以降の
+// 立ち上がりエッジが消えてしまうことがある(実機の鬼のカツ連打で確認済み。
+// 過去に試した「離してもしばらくONを保持する」延長方式は、この張り付きを
+// 悪化させただけだった)。
+// 対策として、他のSYSTEM256太鼓プレイ実装(Arduino経由でアナログ対応I/O
+// ボードに繋ぐ方式)を参考に、「押された瞬間(立ち上がりエッジ)を検出し、
+// キーの押しっぱなし時間に関わらず固定長のパルスを1発だけ出す」方式に
+// 変更する。押しっぱなしにしても延長せず、パルスが終われば必ずOFFに戻る
+// ので、次の打鍵までの間に必ずOFF区間ができ、SYSTEM256側が別々のヒットと
+// して検出しやすくなる。
+// パルス幅は実機の反応と連打の潰れ具合を見ながら微調整が要る値なので、
+// キー割り当てテーブルと同じくマジックバイト("TPLS")付きにして、
+// ブラウザの書き込みツールからビルドし直さずに調整できるようにしてある。
+static const __code uint8_t taiko_pulse_msec_with_magic[4 + 1] = {
+    'T', 'P', 'L', 'S',
+    20,
+};
+#define TAIKO_HIT_PULSE_MSEC (taiko_pulse_msec_with_magic[4])
+
+// ゾーンごとのパルス状態。インデックスはanalog[]と同じ(0..7)。
+static uint16_t hit_pulse_started_at[8];
+static bool hit_pulse_active[8];
+static bool hit_prev_pressed[8];
+
+// 太鼓の1ゾーン分の入力(press/release)をanalog[index]へ書き込む。
+// 立ち上がりエッジを検出したら固定長(TAIKO_HIT_PULSE_MSEC)のパルスを
+// 1発出す。パルス中は新たな押下を無視し、パルスが終わったら必ずOFFに戻す
+// (押しっぱなしにしてもパルス幅は伸びない)。
+static void taiko_hit_zone(uint8_t index, bool pressed) {
+  if (hit_pulse_active[index]) {
+    if (timer3_tick_msec_between(
+            hit_pulse_started_at[index],
+            hit_pulse_started_at[index] + TAIKO_HIT_PULSE_MSEC)) {
+      analog[index] = 0xffff;  // パルス継続中
+      hit_prev_pressed[index] = pressed;
+      return;
+    }
+    hit_pulse_active[index] = false;
+    analog[index] = 0x0000;
+  }
+  if (pressed && !hit_prev_pressed[index]) {
+    // 立ち上がりエッジ: 新しいパルスを開始する。
+    hit_pulse_active[index] = true;
+    hit_pulse_started_at[index] = timer3_tick_msec();
+    analog[index] = 0xffff;
+  } else {
+    analog[index] = 0x0000;
+  }
+  hit_prev_pressed[index] = pressed;
+}
+
 static bool key_pressed(const uint8_t* data, uint8_t keycode) {
   // USBキーボードレポート(8byte): byte0=修飾キー, byte1=予約,
   // byte2-7=最大6キー同時押しのUsage ID(0はキー無し)。
@@ -106,6 +163,26 @@ static bool key_pressed(const uint8_t* data, uint8_t keycode) {
     }
   }
   return false;
+}
+
+// --- USBキーボードのオーバーフロー("Error RollOver")対策 ---
+// NKRO非対応のキーボード/おうち太鼓では、同時押しキー数がBootキーボード
+// レポートの表現上限(6キー)を超えると、キー欄(byte2-7)が全て
+// Usage ID 0x01(Keyboard ErrorRollOver)で埋められる。0x01は通常の押下では
+// 絶対に出てこない値なので、これが来た＝「何かが押されているが何が押され
+// ているかは分からない」という意味になる。これをそのまま
+// key_pressed()に通すと全キー不一致(=全部離された)と誤認し、実際には
+// まだ押されているキーまで一瞬OFFになってしまう(太鼓ゾーンの取りこぼしや
+// ENTER/SELECTの誤動作につながる)。
+// 対策として、オーバーフロー中のレポートは捨て、直前の正常なレポートから
+// 得た各キーの状態をそのまま維持する(ヒット信号を人工的に延長するわけでは
+// ないので、連打の検出には影響しない)。
+static bool last_kl[2], last_dl[2], last_dr[2], last_kr[2];
+static bool last_select_up[2], last_select_down[2], last_enter[2];
+static bool last_coin_key[2];
+
+static bool keyboard_report_overflowed(const uint8_t* data) {
+  return data[2] == 0x01;
 }
 
 static bool button_check(uint16_t index, const uint8_t* data) {
@@ -233,9 +310,19 @@ void controller_reset(void) {
     controller_reset_digital_map(p);
     gear_sequence[p] = 1;
     gear_updown[p] = 0;
+    last_kl[p] = false;
+    last_dl[p] = false;
+    last_dr[p] = false;
+    last_kr[p] = false;
+    last_select_up[p] = false;
+    last_select_down[p] = false;
+    last_enter[p] = false;
+    last_coin_key[p] = false;
   }
   for (uint8_t i = 0; i < 8; ++i) {
     analog[i] = 0;
+    hit_pulse_active[i] = false;
+    hit_prev_pressed[i] = false;
   }
   for (uint8_t i = 0; i < 2; ++i) {
     rotary[i] = 0;
@@ -297,29 +384,52 @@ void controller_update(uint8_t hub_index,
       // 実機のTAIKO TESTで確認した実際のインデックス対応（ファイル冒頭コメント参照）。
       // hub 0 = 1Pポート、hub 1 = 2Pポート。
       const __code uint8_t* keymap = KEYMAP(hub);
-      bool kl = key_pressed(data, keymap[0]);
-      bool dl = key_pressed(data, keymap[1]);
-      bool dr = key_pressed(data, keymap[2]);
-      bool kr = key_pressed(data, keymap[3]);
-      if (hub == 0) {
-        analog[5] = kl ? 0xffff : 0x0000;  // 1P KL
-        analog[0] = dl ? 0xffff : 0x0000;  // 1P DL
-        analog[3] = dr ? 0xffff : 0x0000;  // 1P DR
-        analog[4] = kr ? 0xffff : 0x0000;  // 1P KR
+      bool kl, dl, dr, kr;
+      bool select_up, select_down, enter, coin_key;
+      if (keyboard_report_overflowed(data)) {
+        // オーバーフロー中は直前の状態を維持し、このレポートは捨てる。
+        kl = last_kl[hub];
+        dl = last_dl[hub];
+        dr = last_dr[hub];
+        kr = last_kr[hub];
+        select_up = last_select_up[hub];
+        select_down = last_select_down[hub];
+        enter = last_enter[hub];
+        coin_key = last_coin_key[hub];
       } else {
-        analog[1] = kl ? 0xffff : 0x0000;  // 2P KL
-        analog[2] = dl ? 0xffff : 0x0000;  // 2P DL
-        analog[7] = dr ? 0xffff : 0x0000;  // 2P DR
-        analog[6] = kr ? 0xffff : 0x0000;  // 2P KR
+        kl = key_pressed(data, keymap[0]);
+        dl = key_pressed(data, keymap[1]);
+        dr = key_pressed(data, keymap[2]);
+        kr = key_pressed(data, keymap[3]);
+        select_up = key_pressed(data, keymap[4]);
+        select_down = key_pressed(data, keymap[5]);
+        enter = key_pressed(data, keymap[6]);
+        coin_key = key_pressed(data, keymap[7]);
+        last_kl[hub] = kl;
+        last_dl[hub] = dl;
+        last_dr[hub] = dr;
+        last_kr[hub] = kr;
+        last_select_up[hub] = select_up;
+        last_select_down[hub] = select_down;
+        last_enter[hub] = enter;
+        last_coin_key[hub] = coin_key;
+      }
+      if (hub == 0) {
+        taiko_hit_zone(5, kl);  // 1P KL
+        taiko_hit_zone(0, dl);  // 1P DL
+        taiko_hit_zone(3, dr);  // 1P DR
+        taiko_hit_zone(4, kr);  // 1P KR
+      } else {
+        taiko_hit_zone(1, kl);  // 2P KL
+        taiko_hit_zone(2, dl);  // 2P DL
+        taiko_hit_zone(7, dr);  // 2P DR
+        taiko_hit_zone(6, kr);  // 2P KR
       }
 
       // I/O TESTメニュー操作（SELECT UP/DOWN, ENTER）。
       // 既存のu/d/l/rパイプラインをそのまま使い、実際のJVSビットへの変換は
       // ブラウザの「ボタン配置」設定（settings->digital_map）に委ねる。
       struct settings* settings = settings_get();
-      bool select_up = key_pressed(data, keymap[4]);
-      bool select_down = key_pressed(data, keymap[5]);
-      bool enter = key_pressed(data, keymap[6]);
       update_digital_map(digital_map[hub], settings->digital_map[hub][0].data,
                           select_up);
       update_digital_map(digital_map[hub], settings->digital_map[hub][1].data,
@@ -328,7 +438,6 @@ void controller_update(uint8_t hub_index,
                           enter);
 
       // コイン投入（立ち上がりエッジで1枚加算、mahjong_updateと同じ方式）。
-      bool coin_key = key_pressed(data, keymap[7]);
       coin_sw[hub] = (coin_sw[hub] << 1) | (coin_key ? 1 : 0);
       if ((coin_sw[hub] & 3) == 1) {
         coin[hub]++;
@@ -402,15 +511,15 @@ void controller_update(uint8_t hub_index,
     bool gp_kr = (gp[3] != 0xff) && button_check(info->button[gp[3]], data);
     if (gp[0] != 0xff || gp[1] != 0xff || gp[2] != 0xff || gp[3] != 0xff) {
       if (hub == 0) {
-        if (gp[0] != 0xff) analog[5] = gp_kl ? 0xffff : 0x0000;  // 1P KL
-        if (gp[1] != 0xff) analog[0] = gp_dl ? 0xffff : 0x0000;  // 1P DL
-        if (gp[2] != 0xff) analog[3] = gp_dr ? 0xffff : 0x0000;  // 1P DR
-        if (gp[3] != 0xff) analog[4] = gp_kr ? 0xffff : 0x0000;  // 1P KR
+        if (gp[0] != 0xff) taiko_hit_zone(5, gp_kl);  // 1P KL
+        if (gp[1] != 0xff) taiko_hit_zone(0, gp_dl);  // 1P DL
+        if (gp[2] != 0xff) taiko_hit_zone(3, gp_dr);  // 1P DR
+        if (gp[3] != 0xff) taiko_hit_zone(4, gp_kr);  // 1P KR
       } else {
-        if (gp[0] != 0xff) analog[1] = gp_kl ? 0xffff : 0x0000;  // 2P KL
-        if (gp[1] != 0xff) analog[2] = gp_dl ? 0xffff : 0x0000;  // 2P DL
-        if (gp[2] != 0xff) analog[7] = gp_dr ? 0xffff : 0x0000;  // 2P DR
-        if (gp[3] != 0xff) analog[6] = gp_kr ? 0xffff : 0x0000;  // 2P KR
+        if (gp[0] != 0xff) taiko_hit_zone(1, gp_kl);  // 2P KL
+        if (gp[1] != 0xff) taiko_hit_zone(2, gp_dl);  // 2P DL
+        if (gp[2] != 0xff) taiko_hit_zone(7, gp_dr);  // 2P DR
+        if (gp[3] != 0xff) taiko_hit_zone(6, gp_kr);  // 2P KR
       }
     }
   }

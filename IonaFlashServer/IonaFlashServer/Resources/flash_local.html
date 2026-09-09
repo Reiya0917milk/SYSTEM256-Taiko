@@ -32,6 +32,12 @@
   <tr><th>ゾーン</th><th>1Pボタン</th><th>2Pボタン</th></tr>
 </table>
 
+<h2>太鼓ヒット パルス幅調整</h2>
+<p>太鼓の各ゾーンは、押された瞬間に固定長のパルス(ON信号)を1発だけ出す方式になっています。
+短すぎると実機側が取りこぼし、長すぎると連打時に次の打鍵が潰れることがあります。
+実機のTAIKO TEST画面やプレイ感を見ながら調整してください(目安: 10〜40ms程度)。</p>
+<p>パルス幅(ms): <input type="number" id="pulseMsec" min="1" max="255" style="width:5em"></p>
+
 <h2>書き込み</h2>
 <button id="flash">書き込み</button>
 
@@ -105,12 +111,15 @@
   const GAMEPAD_SLOTS = ['KL（縁）', 'DL（面）', 'DR（面）', 'KR（縁）'];
   const GAMEPAD_MAGIC = [0x47, 0x50, 0x4d, 0x50];  // "GPMP"
   const GAMEPAD_UNASSIGNED = 0xff;
+  const PULSE_MAGIC = [0x54, 0x50, 0x4c, 0x53];  // "TPLS"
 
   let originalBin = null;   // ArrayBuffer（サーバーから取得した元のバイナリ）
   let magicOffset = -1;     // originalBin内でのマジック開始位置
   let keymap = null;        // 現在編集中のキー割り当て(Usage ID 16個、[0-7]=1P, [8-15]=2P)
   let gamepadMagicOffset = -1;  // GPMPの開始位置
   let gamepadKeymap = null;     // ボタン番号8個、[0-3]=1P, [4-7]=2P
+  let pulseMagicOffset = -1;    // TPLSの開始位置
+  let pulseMsec = 20;           // 現在編集中のパルス幅(ms)
 
   function findMagic(bytes, magic) {
     for (let i = 0; i + magic.length <= bytes.length; ++i) {
@@ -300,6 +309,22 @@
           Array.from(bytes.slice(gamepadMagicOffset + 4, gamepadMagicOffset + 12));
       renderGamepadTable();
 
+      pulseMagicOffset = findMagic(bytes, PULSE_MAGIC);
+      if (pulseMagicOffset < 0) {
+        throw new Error('パルス幅設定(マジックバイト)が見つかりません。' +
+            'このファームウェアはパルス幅調整に対応していない可能性があります。');
+      }
+      pulseMsec = bytes[pulseMagicOffset + 4];
+      const pulseInput = document.getElementById('pulseMsec');
+      pulseInput.value = pulseMsec;
+      pulseInput.addEventListener('change', () => {
+        let v = parseInt(pulseInput.value, 10);
+        if (isNaN(v) || v < 1) v = 1;
+        if (v > 255) v = 255;
+        pulseMsec = v;
+        pulseInput.value = v;
+      });
+
       errorEl.innerText = '準備完了。「書き込み」ボタンを押してください';
     } catch (e) {
       errorEl.innerText = '例外が発生しました: ' + e;
@@ -313,10 +338,11 @@
     progressWrite.value = 0;
     progressVerify.value = 0;
     try {
-      if (!originalBin || magicOffset < 0 || gamepadMagicOffset < 0) {
+      if (!originalBin || magicOffset < 0 || gamepadMagicOffset < 0 ||
+          pulseMagicOffset < 0) {
         throw new Error('ファームウェアがまだ準備できていません');
       }
-      // 元のバイナリをコピーし、キー/ボタン割り当て部分だけ書き換える。
+      // 元のバイナリをコピーし、キー/ボタン割り当て・パルス幅だけ書き換える。
       const patched = new Uint8Array(originalBin.slice(0));
       for (let i = 0; i < keymap.length; ++i) {
         patched[magicOffset + 4 + i] = keymap[i];
@@ -324,6 +350,7 @@
       for (let i = 0; i < gamepadKeymap.length; ++i) {
         patched[gamepadMagicOffset + 4 + i] = gamepadKeymap[i];
       }
+      patched[pulseMagicOffset + 4] = pulseMsec;
 
       errorEl.innerText = '接続中...';
       const flasher = new CH559Flasher();
